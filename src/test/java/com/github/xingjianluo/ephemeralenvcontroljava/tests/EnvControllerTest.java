@@ -76,6 +76,56 @@ class EnvControllerTest {
     }
 
     @Test
+    void renewSuccessReplayAndRejectionAreDistinguishable() throws Exception {
+        // 先申请
+        acquire("rn-1", "alice", "rn1", 60_000);
+
+        // 续期成功 200
+        MvcResult ok1 = mvc.perform(post("/api/envs/rn1/renew")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of(
+                                "idempotencyId", "renew-1", "owner", "alice", "extendMillis", 30_000))))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode okBody = json.readTree(ok1.getResponse().getContentAsString());
+        assertFalse(okBody.get("replayed").asBoolean());
+
+        // 同标识重放 200 replayed=true，到期时刻一致
+        MvcResult ok2 = mvc.perform(post("/api/envs/rn1/renew")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of(
+                                "idempotencyId", "renew-1", "owner", "alice", "extendMillis", 30_000))))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode replayBody = json.readTree(ok2.getResponse().getContentAsString());
+        assertTrue(replayBody.get("replayed").asBoolean());
+        assertEquals(okBody.get("lease").get("expireAtMillis").asLong(),
+                replayBody.get("lease").get("expireAtMillis").asLong());
+
+        // 越权续期 -> 409 renewal_rejected/NOT_OWNER/retryable=false
+        MvcResult denied = mvc.perform(post("/api/envs/rn1/renew")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of(
+                                "idempotencyId", "renew-2", "owner", "bob", "extendMillis", 30_000))))
+                .andExpect(status().isConflict()).andReturn();
+        JsonNode db = json.readTree(denied.getResponse().getContentAsString());
+        assertEquals("renewal_rejected", db.get("type").asText());
+        assertEquals("NOT_OWNER", db.get("reason").asText());
+        assertFalse(db.get("retryable").asBoolean());
+
+        // 到期后续期 -> 409 renewal_rejected/ALREADY_EXPIRED
+        // 首次续期 30s 已把到期点从 +60s 顺延到 +90s，需越过新到期点
+        now.addAndGet(90_001);
+        MvcResult late = mvc.perform(post("/api/envs/rn1/renew")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of(
+                                "idempotencyId", "renew-3", "owner", "alice", "extendMillis", 30_000))))
+                .andExpect(status().isConflict()).andReturn();
+        JsonNode lb = json.readTree(late.getResponse().getContentAsString());
+        assertEquals("ALREADY_EXPIRED", lb.get("reason").asText());
+        assertFalse(lb.get("retryable").asBoolean());
+        testLog.info("[ASSERT] op=HTTP_RENEW basis=ok-replay-notowner-expired");
+    }
+
+    @Test
     void quotaRejectionConflictAndRetryableFailureAreDistinguishable() throws Exception {
         // 持有者配额打满 -> 409 rejected/OWNER_QUOTA_EXCEEDED/retryable=false
         acquire("q1", "alice", "q1", 60_000);

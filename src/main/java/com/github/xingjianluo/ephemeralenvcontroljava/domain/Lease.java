@@ -14,4 +14,12 @@ public record Lease(
     public Lease withState(LeaseState newState) {
         return new Lease(envName, owner, idempotencyId, acquiredAtMillis, expireAtMillis, newState);
     }
+
+    /**
+     * 续期：在当前到期时刻基础上顺延 extendMillis（多次续期累加），不改变已流逝时间与占用状态。
+     */
+    public Lease withExtendedExpiration(long extendMillis) {
+        return new Lease(envName, owner, idempotencyId, acquiredAtMillis,
+                expireAtMillis + extendMillis, state);
+    }
 }

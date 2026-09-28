@@ -22,6 +22,7 @@ public class InMemoryLeaseStore implements LeaseStore {
 
     private final ConcurrentHashMap<String, Lease> leases = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, IdempotencyRecord> idempotency = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RenewalIdempotencyRecord> renewalIdempotency = new ConcurrentHashMap<>();
 
     @Override
     public Lease get(String envName) {
@@ -72,6 +73,16 @@ public class InMemoryLeaseStore implements LeaseStore {
     }
 
     @Override
+    public RenewalIdempotencyRecord getRenewalIdempotency(String idempotencyId) {
+        return renewalIdempotency.get(idempotencyId);
+    }
+
+    @Override
+    public void putRenewalIdempotencyIfAbsent(RenewalIdempotencyRecord record) {
+        renewalIdempotency.putIfAbsent(record.idempotencyId(), record);
+    }
+
+    @Override
     public long countByState(LeaseState state) {
         return leases.values().stream().filter(l -> l.state() == state).count();
     }
@@ -80,5 +91,6 @@ public class InMemoryLeaseStore implements LeaseStore {
     public void clear() {
         leases.clear();
         idempotency.clear();
+        renewalIdempotency.clear();
     }
 }

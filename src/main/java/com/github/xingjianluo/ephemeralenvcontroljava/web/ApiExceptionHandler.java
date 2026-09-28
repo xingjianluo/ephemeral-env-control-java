@@ -3,6 +3,7 @@ package com.github.xingjianluo.ephemeralenvcontroljava.web;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.AcquireRejectedException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ConflictException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ReclaimFailureException;
+import com.github.xingjianluo.ephemeralenvcontroljava.exception.RenewalRejectedException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -25,6 +26,16 @@ public class ApiExceptionHandler {
                 "type", "rejected",
                 "reason", ex.getReason().name(),
                 "retryable", false,
+                "message", ex.getMessage()));
+    }
+
+    @ExceptionHandler(RenewalRejectedException.class)
+    public ResponseEntity<Map<String, Object>> handleRenewalRejected(RenewalRejectedException ex) {
+        // 续期被明确拒绝：给出可区分原因与是否可重试；绝无“成功但环境不可用”的假结论。
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                "type", "renewal_rejected",
+                "reason", ex.getReason().name(),
+                "retryable", ex.isRetryable(),
                 "message", ex.getMessage()));
     }
 

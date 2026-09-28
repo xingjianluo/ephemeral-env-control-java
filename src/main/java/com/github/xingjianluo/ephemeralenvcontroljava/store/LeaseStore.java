@@ -28,6 +28,12 @@ public interface LeaseStore {
 
     void putIdempotencyIfAbsent(IdempotencyRecord record);
 
+    /** 续期幂等记录：按幂等标识读取首次续期结论。 */
+    RenewalIdempotencyRecord getRenewalIdempotency(String idempotencyId);
+
+    /** 续期幂等记录：仅在首次时写入，保证同一标识只有一个首次结论。 */
+    void putRenewalIdempotencyIfAbsent(RenewalIdempotencyRecord record);
+
     /** 状态统计（含各状态租约数），用于测试断言守恒。 */
     long countByState(LeaseState state);
 
