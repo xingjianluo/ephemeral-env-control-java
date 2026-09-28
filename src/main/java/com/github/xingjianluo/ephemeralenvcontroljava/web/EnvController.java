@@ -3,6 +3,7 @@ package com.github.xingjianluo.ephemeralenvcontroljava.web;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.AcquireResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.ReclaimResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.ReleaseResult;
+import com.github.xingjianluo.ephemeralenvcontroljava.domain.RenewResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.service.EphemeralEnvService;
 import org.springframework.web.bind.annotation.*;
 
@@ -19,12 +20,19 @@ public class EnvController {
     }
 
     public record AcquireRequest(String idempotencyId, String owner, String envName, Long ttlMillis) { }
+    public record RenewRequest(String idempotencyId, String owner, Long extendMillis) { }
     public record ReleaseRequest(String owner) { }
 
     @PostMapping("/acquire")
     public AcquireResult acquire(@RequestBody AcquireRequest req) {
         return service.acquire(req.idempotencyId(), req.owner(), req.envName(),
                 req.ttlMillis() == null ? 0L : req.ttlMillis());
+    }
+
+    @PostMapping("/{envName}/renew")
+    public RenewResult renew(@PathVariable String envName, @RequestBody RenewRequest req) {
+        return service.renew(req.idempotencyId(), req.owner(), envName,
+                req.extendMillis() == null ? 0L : req.extendMillis());
     }
 
     @PostMapping("/{envName}/release")

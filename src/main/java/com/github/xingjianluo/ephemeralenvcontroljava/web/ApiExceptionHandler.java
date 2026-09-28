@@ -3,6 +3,7 @@ package com.github.xingjianluo.ephemeralenvcontroljava.web;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.AcquireRejectedException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ConflictException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ReclaimFailureException;
+import com.github.xingjianluo.ephemeralenvcontroljava.exception.RenewRejectedException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -13,6 +14,7 @@ import java.util.Map;
 /**
  * 三类失败的 HTTP 语义刻意区分：
  * - 409 + rejected：确定性拒绝（配额 / 被他人占用），不应原样重试；
+ * - 409 + renew_rejected：续期确定性/可重试拒绝（越权 / 已过期 / 终态 / 中间态），按 retryable 决定；
  * - 409 + conflict：状态冲突（中间态 / 参数与幂等键不一致），可重试或修正；
  * - 202 + retryable：回收中途失败，租约停留在 RECLAIMING，应重试回收。
  */
@@ -26,6 +28,15 @@ public class ApiExceptionHandler {
                 "reason", ex.getReason().name(),
                 "retryable", false,
                 "message", ex.getMessage()));
+    }
+
+    @ExceptionHandler(RenewRejectedException.class)
+    public ResponseEntity<Map<String, Object>> handleRenewRejected(RenewRejectedException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                "type", "renew_rejected",
+                "reason", ex.getReason().name(),
+                "retryable", ex.isRetryable(),
+                "message", ex.getMessage() == null ? "" : ex.getMessage()));
     }
 
     @ExceptionHandler(ConflictException.class)

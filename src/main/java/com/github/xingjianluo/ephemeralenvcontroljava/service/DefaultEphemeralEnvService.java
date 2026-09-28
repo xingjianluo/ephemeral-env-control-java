@@ -5,13 +5,17 @@ import com.github.xingjianluo.ephemeralenvcontroljava.domain.Lease;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.LeaseState;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.ReclaimResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.ReleaseResult;
+import com.github.xingjianluo.ephemeralenvcontroljava.domain.RenewResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.AcquireRejectedException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ConflictException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ReclaimFailureException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.RejectionReason;
+import com.github.xingjianluo.ephemeralenvcontroljava.exception.RenewRejectedException;
+import com.github.xingjianluo.ephemeralenvcontroljava.exception.RenewRejectionReason;
 import com.github.xingjianluo.ephemeralenvcontroljava.quota.QuotaService;
 import com.github.xingjianluo.ephemeralenvcontroljava.reclaim.ReclaimFailureSimulator;
 import com.github.xingjianluo.ephemeralenvcontroljava.store.IdempotencyRecord;
+import com.github.xingjianluo.ephemeralenvcontroljava.store.IdempotentOperation;
 import com.github.xingjianluo.ephemeralenvcontroljava.store.LeaseStore;
 import com.github.xingjianluo.ephemeralenvcontroljava.time.Clock;
 import org.slf4j.Logger;
@@ -188,6 +192,160 @@ public class DefaultEphemeralEnvService implements EphemeralEnvService {
         }
         if (ttlMillis <= 0) {
             throw new IllegalArgumentException("ttlMillis 必须为正数");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 续期
+    // ------------------------------------------------------------------
+
+    @Override
+    public RenewResult renew(String idempotencyId, String owner, String envName, long extendMillis) {
+        validateRenewArgs(idempotencyId, owner, envName, extendMillis);
+
+        // 快速路径：直接命中首次续期结论。
+        IdempotencyRecord existing = store.getIdempotency(idempotencyId);
+        if (existing != null) {
+            return replayRenew(existing, owner, envName);
+        }
+
+        // 每环境互斥：与 release / reclaim 串行，使“临界点先后”只有唯一结论。
+        synchronized (envLock(envName)) {
+            for (;;) {
+                // 双重检查：等锁期间可能已由其他线程写入首次结论。
+                existing = store.getIdempotency(idempotencyId);
+                if (existing != null) {
+                    return replayRenew(existing, owner, envName);
+                }
+
+                Lease lease = store.get(envName);
+                if (lease == null) {
+                    return rejectRenew(idempotencyId, owner, envName, null,
+                            RenewRejectionReason.LEASE_NOT_FOUND, "环境 " + envName + " 不存在租约");
+                }
+                if (!owner.equals(lease.owner())) {
+                    return rejectRenew(idempotencyId, owner, envName, lease,
+                            RenewRejectionReason.NOT_OWNER,
+                            "环境 " + envName + " 不属于持有者 " + owner + "，实际持有者为 " + lease.owner());
+                }
+
+                switch (lease.state()) {
+                    case RELEASED, RECLAIMED -> {
+                        return rejectRenew(idempotencyId, owner, envName, lease,
+                                RenewRejectionReason.ALREADY_TERMINAL,
+                                "环境 " + envName + " 已进入终态 " + lease.state() + "，续期迟到，结论不回退");
+                    }
+                    case RELEASING -> {
+                        // 释放动作进行中：结论未定，不落幂等记录，调用方稍后重试拿确定结论。
+                        log.info("op=RENEW idempotencyId={} env={} owner={} decision=RETRY basis=releasingInProgress",
+                                idempotencyId, envName, owner);
+                        throw new RenewRejectedException(RenewRejectionReason.TRANSITION_IN_PROGRESS,
+                                "环境 " + envName + " 正在释放，请稍后重试");
+                    }
+                    case RECLAIMING -> {
+                        // 回收进行中（含回收失败待重试）：绝不把环境拉回可用；不落记录，稍后重试。
+                        log.info("op=RENEW idempotencyId={} env={} owner={} decision=RETRY basis=reclaimingInProgress",
+                                idempotencyId, envName, owner);
+                        throw new RenewRejectedException(RenewRejectionReason.TRANSITION_IN_PROGRESS,
+                                "环境 " + envName + " 正在回收（含回收失败待重试），不能续期，请稍后重试");
+                    }
+                    case EXPIRED -> {
+                        return rejectRenew(idempotencyId, owner, envName, lease,
+                                RenewRejectionReason.ALREADY_EXPIRED,
+                                "环境 " + envName + " 已过期，续期迟到，不能救活已过期环境");
+                    }
+                    case ACTIVE -> {
+                        long now = clock.nowMillis();
+                        if (now >= lease.expireAtMillis()) {
+                            // 到期的 ACTIVE 先懒标记到 EXPIRED（与 reclaim 同一套临界判定），
+                            // 再给出确定性拒绝——绝不在过期后靠续期救活环境。
+                            Lease marked = store.compareAndUpdate(envName,
+                                    l -> l.state() == LeaseState.ACTIVE
+                                            && clock.nowMillis() >= l.expireAtMillis(),
+                                    l -> l.withState(LeaseState.EXPIRED));
+                            if (marked == null) {
+                                // 等锁/并发期间状态已被流转（如 reclaim 抢先）：循环重判。
+                                continue;
+                            }
+                            return rejectRenew(idempotencyId, owner, envName, marked,
+                                    RenewRejectionReason.ALREADY_EXPIRED,
+                                    "环境 " + envName + " 租约已到期，续期迟到，不能救活已过期环境");
+                        }
+
+                        // 顺延基准是“当前到期时刻”，不是 now：已经流逝的时间不会被重新续回来。
+                        long previousExpire = lease.expireAtMillis();
+                        long newExpire = previousExpire + extendMillis;
+                        // CAS 断言严格限定 ACTIVE 且未到期且持有者不变，防止任何并发流转后回退状态。
+                        Lease renewed = store.compareAndUpdate(envName,
+                                l -> l.state() == LeaseState.ACTIVE
+                                        && owner.equals(l.owner())
+                                        && clock.nowMillis() < l.expireAtMillis(),
+                                l -> l.withExpireAtMillis(l.expireAtMillis() + extendMillis));
+                        if (renewed == null) {
+                            // 临界区内被并发流转：回到判定，按已有结论一致处理。
+                            continue;
+                        }
+
+                        IdempotencyRecord rec = new IdempotencyRecord(
+                                idempotencyId, IdempotentOperation.RENEW, owner, envName,
+                                true, renewed, null, "续期成功", now, previousExpire);
+                        store.putIdempotencyIfAbsent(rec);
+                        log.info("op=RENEW idempotencyId={} env={} owner={} decision=ACCEPT basis=activeBeforeExpiry "
+                                        + "expireAt {} -> {} (+{}) state=ACTIVE quotaUnchanged=true",
+                                idempotencyId, envName, owner, previousExpire, newExpire, extendMillis);
+                        return new RenewResult(renewed, false, previousExpire, "续期成功");
+                    }
+                }
+            }
+        }
+    }
+
+    private RenewResult replayRenew(IdempotencyRecord rec, String owner, String envName) {
+        if (rec.operation() != IdempotentOperation.RENEW) {
+            // 同一幂等标识被申请 / 续期跨操作复用：冲突，调用方需换键重试。
+            throw new ConflictException("幂等标识 " + rec.idempotencyId()
+                    + " 已绑定 " + rec.operation() + " 操作，不能用于续期");
+        }
+        if (!rec.owner().equals(owner) || !rec.envName().equals(envName)) {
+            throw new ConflictException("幂等标识 " + rec.idempotencyId()
+                    + " 已绑定 owner=" + rec.owner() + ", env=" + rec.envName());
+        }
+        if (!rec.accepted()) {
+            RenewRejectionReason reason = RenewRejectionReason.valueOf(rec.rejectionCode());
+            log.info("op=RENEW_REPLAY idempotencyId={} env={} owner={} decision=REJECT_REPLAY reason={}",
+                    rec.idempotencyId(), envName, owner, reason);
+            throw new RenewRejectedException(reason, rec.rejectionMessage());
+        }
+        log.info("op=RENEW_REPLAY idempotencyId={} env={} owner={} decision=ACCEPT_REPLAY basis=idempotentRecord",
+                rec.idempotencyId(), envName, owner);
+        return new RenewResult(rec.lease(), true, rec.previousExpireAtMillis(),
+                "幂等重放: " + rec.rejectionMessage());
+    }
+
+    private RenewResult rejectRenew(String idempotencyId, String owner, String envName,
+                                    Lease lease, RenewRejectionReason reason, String message) {
+        IdempotencyRecord rec = new IdempotencyRecord(
+                idempotencyId, IdempotentOperation.RENEW, owner, envName,
+                false, lease, reason.name(), message, clock.nowMillis(),
+                lease == null ? 0L : lease.expireAtMillis());
+        store.putIdempotencyIfAbsent(rec);
+        log.info("op=RENEW idempotencyId={} env={} owner={} decision=REJECT reason={} retryable={} basis={}",
+                idempotencyId, envName, owner, reason, reason.isRetryable(), message);
+        throw new RenewRejectedException(reason, message);
+    }
+
+    private void validateRenewArgs(String idempotencyId, String owner, String envName, long extendMillis) {
+        if (idempotencyId == null || idempotencyId.isBlank()) {
+            throw new IllegalArgumentException("idempotencyId 不能为空");
+        }
+        if (owner == null || owner.isBlank()) {
+            throw new IllegalArgumentException("owner 不能为空");
+        }
+        if (envName == null || envName.isBlank()) {
+            throw new IllegalArgumentException("envName 不能为空");
+        }
+        if (extendMillis <= 0) {
+            throw new IllegalArgumentException("extendMillis 必须为正数");
         }
     }
 
