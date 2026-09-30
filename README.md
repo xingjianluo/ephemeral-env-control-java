@@ -52,8 +52,13 @@
   - 返回与首次一致的结果（同一份租约 / 同一份续期后到期时刻 / 同一个拒绝原因），`replayed=true`；
   - 不重复占用、释放配额，也不重复顺延到期时刻；
   - 若同一幂等标识绑定的 `owner/envName` 与首次不同，返回可重试的 `conflict`。
-- **操作命名空间隔离**：幂等记录按操作类型（`ACQUIRE` / `RENEW`）区分。同一幂等标识
-  先用于申请、再用于续期（或反过来）会得到 `conflict`，调用方应换键。
+- **操作命名空间隔离**：幂等记录按操作类型（`ACQUIRE` / `RENEW`）区分，申请成功、
+  续期成功、申请被拒、续期被拒四类结论各自独立、互不串用。同一幂等标识先用于
+  申请、再用于续期（或反过来）——无论首次结论是成功还是拒绝——都统一收敛为
+  可区分的 `conflict`（HTTP 409 `type=conflict`，`retryable=true`），调用方据此
+  换标识重试；**不会**被当成另一类操作的成功/拒绝重放，不会返回 400 参数错误，
+  也不会真的生效一次申请或续期：租约状态、到期时刻、占用数量全部不变。
+  该隔离在两个方向（申请→续期、续期→申请）上一致成立。
 - 释放与回收天然幂等：终态上重复调用返回首次结论，不做第二次扣减。
 - **续期结论的“确定性 / 可重试”边界**：
   - 越权（`NOT_OWNER`）、已过期（`ALREADY_EXPIRED`）、终态（`ALREADY_TERMINAL`）、
@@ -98,6 +103,7 @@
 | 续期越权 / 已过期 / 终态 / 无租约 | `RenewRejectedException`，HTTP 409 `type=renew_rejected`，reason=`NOT_OWNER/ALREADY_EXPIRED/ALREADY_TERMINAL/LEASE_NOT_FOUND` | false | 确定性结论，同幂等键一致重放，续期不生效 |
 | 续期时环境在释放/回收途中（含回收失败待重试） | `RenewRejectedException`，HTTP 409 `type=renew_rejected`，reason=`TRANSITION_IN_PROGRESS` | true | 结论未收敛，稍后重试拿确定结论，绝不假成功 |
 | 幂等键参数不一致、未到期回收、非持有者释放 | `ConflictException`，HTTP 409 `type=conflict` | true | 状态冲突，修正或稍后重试 |
+| 幂等标识跨操作复用（申请↔续期，无论首次成功或拒绝） | `ConflictException`，HTTP 409 `type=conflict` | true | 操作命名空间隔离，换标识重试；不生效、不改状态与配额 |
 | 回收中途失败 | `ReclaimFailureException`，HTTP 202 `type=reclaim_failed` | true | 停留 RECLAIMING，重试回收即可收敛 |
 
 服务日志统一打印 `op`（操作类型）、`idempotencyId`、`env`、`owner`、
@@ -133,8 +139,8 @@ POST /api/envs/sweep              # 扫描并回收所有到期/回收中的租�
 mvn -o test
 ```
 
-覆盖场景（`EphemeralEnvServiceTest` 12 例、`RenewalServiceTest` 13 例、`EnvControllerTest` 3 例，
-另有 Spring 上下文 1 例）：
+覆盖场景（`EphemeralEnvServiceTest` 12 例、`RenewalServiceTest` 13 例、
+`CrossOperationIdempotencyTest` 4 例、`EnvControllerTest` 3 例，另有 Spring 上下文 1 例）：
 
 1. **幂等**：同一幂等标识串行 / 多线程并发重复提交，只有一次生效，全部拿到
    同一份首次租约；被拒绝的首次结论也会一致重放。
@@ -158,6 +164,10 @@ mvn -o test
     并发交错下没有任何一次续期能成功回退已进入回收/终态的环境。
 12. **续期并发配额守恒**：续期与申请/释放交错的高并发压力下，持有者与全局上限始终
     不被突破，实时占用数与占用态租约数始终相等；续期全程不改变占用数量。
+13. **跨操作幂等标识隔离**：续期成功 / 续期被拒后的标识再发起申请，以及申请成功 /
+    申请被拒后的标识再发起续期，两个方向都统一得到可区分的 `conflict`（而非 400
+    参数错误、也不是另一类操作的重放），且租约状态、到期时刻、占用数量、租约总数
+    全部不变；原操作的幂等结论仍可按原操作一致重放。
 
 控制台与 surefire 报告中的 `op=...` / `[ASSERT] ...` 行会打印每个操作的
 幂等标识、操作类型与判定依据。

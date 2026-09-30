@@ -149,6 +149,12 @@ public class DefaultEphemeralEnvService implements EphemeralEnvService {
     }
 
     private AcquireResult replayAcquire(IdempotencyRecord rec, String owner, String envName) {
+        if (rec.operation() != IdempotentOperation.ACQUIRE) {
+            // 同一幂等标识被续期 / 申请跨操作复用：冲突，调用方需换键重试。
+            // 绝不把续期结论当成申请结论重放，也不产生任何新的占用或配额变化。
+            throw new ConflictException("幂等标识 " + rec.idempotencyId()
+                    + " 已绑定 " + rec.operation() + " 操作，不能用于申请");
+        }
         if (!rec.owner().equals(owner) || !rec.envName().equals(envName)) {
             // 幂等键复用但请求体不同：冲突，调用方需换键重试。
             throw new ConflictException("幂等标识 " + rec.idempotencyId()
