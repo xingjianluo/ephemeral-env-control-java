@@ -6,6 +6,7 @@ import com.github.xingjianluo.ephemeralenvcontroljava.domain.LeaseState;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.ReclaimResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.RenewResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ConflictException;
+import com.github.xingjianluo.ephemeralenvcontroljava.exception.ConflictReason;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ReclaimFailureException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.RenewRejectedException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.RenewRejectionReason;
@@ -345,12 +346,14 @@ class RenewalServiceTest {
     }
 
     @Test
-    @DisplayName("申请幂等键不能跨操作复用于续期")
+    @DisplayName("申请幂等键不能跨操作复用于续期：明确冲突且不顺延")
     void acquireIdempotencyKeyCannotBeReusedForRenew() {
         String shared = idem();
         service.acquire(shared, "alice", "k1", 60_000);
         ConflictException ex = assertThrows(ConflictException.class,
                 () -> service.renew(shared, "alice", "k1", 10_000));
+        assertEquals(ConflictReason.IDEMPOTENCY_OPERATION_MISMATCH, ex.getReason());
+        assertFalse(ex.getReason().isRetryableWithSameRequest(), "必须换键，原样重试无意义");
         assertTrue(ex.getMessage().contains("ACQUIRE"));
         assertEquals(1_060_000L, store.get("k1").expireAtMillis(), "跨操作复用不得顺延");
         testLog.info("[ASSERT] op=RENEW basis=idempotency-namespace-conflict key={}", shared);

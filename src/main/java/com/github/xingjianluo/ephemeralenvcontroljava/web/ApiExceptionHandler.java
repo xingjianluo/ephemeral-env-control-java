@@ -15,7 +15,10 @@ import java.util.Map;
  * 三类失败的 HTTP 语义刻意区分：
  * - 409 + rejected：确定性拒绝（配额 / 被他人占用），不应原样重试；
  * - 409 + renew_rejected：续期确定性/可重试拒绝（越权 / 已过期 / 终态 / 中间态），按 retryable 决定；
- * - 409 + conflict：状态冲突（中间态 / 参数与幂等键不一致），可重试或修正；
+ * - 409 + conflict：状态冲突。reason=IDEMPOTENCY_OPERATION_MISMATCH 表示幂等标识跨操作
+ *   （申请 ↔ 续期）复用、reason=IDEMPOTENCY_REQUEST_MISMATCH 表示同键参数不一致，
+ *   二者 retryable=false，必须换键 / 修正；reason=LEASE_STATE_CONFLICT 为租约状态冲突，
+ *   retryable=true，可稍后用同一请求重试；
  * - 202 + retryable：回收中途失败，租约停留在 RECLAIMING，应重试回收。
  */
 @RestControllerAdvice
@@ -43,7 +46,8 @@ public class ApiExceptionHandler {
     public ResponseEntity<Map<String, Object>> handleConflict(ConflictException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
                 "type", "conflict",
-                "retryable", true,
+                "reason", ex.getReason().name(),
+                "retryable", ex.getReason().isRetryableWithSameRequest(),
                 "message", ex.getMessage()));
     }
 

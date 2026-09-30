@@ -8,6 +8,7 @@ import com.github.xingjianluo.ephemeralenvcontroljava.domain.ReleaseResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.domain.RenewResult;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.AcquireRejectedException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ConflictException;
+import com.github.xingjianluo.ephemeralenvcontroljava.exception.ConflictReason;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.ReclaimFailureException;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.RejectionReason;
 import com.github.xingjianluo.ephemeralenvcontroljava.exception.RenewRejectedException;
@@ -149,10 +150,22 @@ public class DefaultEphemeralEnvService implements EphemeralEnvService {
     }
 
     private AcquireResult replayAcquire(IdempotencyRecord rec, String owner, String envName) {
+        if (rec.operation() != IdempotentOperation.ACQUIRE) {
+            // 同一幂等标识被续期 / 申请跨操作复用：与其它冲突一致的确定性冲突，
+            // 调用方据此换键重试，绝不把续期结论（成功或拒绝）当成申请结论重放，
+            // 更不允许在此新建租约或改变配额。
+            log.info("op=ACQUIRE_REPLAY idempotencyId={} env={} owner={} decision=CONFLICT "
+                            + "basis=idempotencyOperationMismatch boundOperation={}",
+                    rec.idempotencyId(), envName, owner, rec.operation());
+            throw new ConflictException(ConflictReason.IDEMPOTENCY_OPERATION_MISMATCH,
+                    "幂等标识 " + rec.idempotencyId() + " 已绑定 " + rec.operation()
+                            + " 操作，不能用于申请（ACQUIRE），请更换幂等标识");
+        }
         if (!rec.owner().equals(owner) || !rec.envName().equals(envName)) {
-            // 幂等键复用但请求体不同：冲突，调用方需换键重试。
-            throw new ConflictException("幂等标识 " + rec.idempotencyId()
-                    + " 已绑定 owner=" + rec.owner() + ", env=" + rec.envName());
+            // 幂等键复用但请求体不同：确定性冲突，调用方需换键重试。
+            throw new ConflictException(ConflictReason.IDEMPOTENCY_REQUEST_MISMATCH,
+                    "幂等标识 " + rec.idempotencyId()
+                            + " 已绑定 owner=" + rec.owner() + ", env=" + rec.envName());
         }
         if (!rec.accepted()) {
             log.info("op=ACQUIRE_REPLAY idempotencyId={} env={} owner={} decision=REJECT_REPLAY basis={}",
@@ -302,13 +315,19 @@ public class DefaultEphemeralEnvService implements EphemeralEnvService {
 
     private RenewResult replayRenew(IdempotencyRecord rec, String owner, String envName) {
         if (rec.operation() != IdempotentOperation.RENEW) {
-            // 同一幂等标识被申请 / 续期跨操作复用：冲突，调用方需换键重试。
-            throw new ConflictException("幂等标识 " + rec.idempotencyId()
-                    + " 已绑定 " + rec.operation() + " 操作，不能用于续期");
+            // 同一幂等标识被申请 / 续期跨操作复用：确定性冲突，调用方需换键重试。
+            // 绝不把申请结论（成功或拒绝）当成续期结论重放，也不顺延到期时刻。
+            log.info("op=RENEW_REPLAY idempotencyId={} env={} owner={} decision=CONFLICT "
+                            + "basis=idempotencyOperationMismatch boundOperation={}",
+                    rec.idempotencyId(), envName, owner, rec.operation());
+            throw new ConflictException(ConflictReason.IDEMPOTENCY_OPERATION_MISMATCH,
+                    "幂等标识 " + rec.idempotencyId() + " 已绑定 " + rec.operation()
+                            + " 操作，不能用于续期（RENEW），请更换幂等标识");
         }
         if (!rec.owner().equals(owner) || !rec.envName().equals(envName)) {
-            throw new ConflictException("幂等标识 " + rec.idempotencyId()
-                    + " 已绑定 owner=" + rec.owner() + ", env=" + rec.envName());
+            throw new ConflictException(ConflictReason.IDEMPOTENCY_REQUEST_MISMATCH,
+                    "幂等标识 " + rec.idempotencyId()
+                            + " 已绑定 owner=" + rec.owner() + ", env=" + rec.envName());
         }
         if (!rec.accepted()) {
             RenewRejectionReason reason = RenewRejectionReason.valueOf(rec.rejectionCode());

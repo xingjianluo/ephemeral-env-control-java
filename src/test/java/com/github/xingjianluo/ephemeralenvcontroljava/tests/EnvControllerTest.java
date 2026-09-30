@@ -166,4 +166,52 @@ class EnvControllerTest {
         assertFalse(ag.get("retryable").asBoolean());
         testLog.info("[ASSERT] op=HTTP_RENEW basis=200-replay/409-not-owner/409-reclaiming/409-terminal");
     }
+
+    @Test
+    void crossOperationIdempotencyReuseIs409OperationMismatchInBothDirections() throws Exception {
+        acquire("xa", "alice", "xn", 60_000);
+
+        // 方向一：续期成功后的标识再申请 -> 409 conflict/IDEMPOTENCY_OPERATION_MISMATCH/400 不得出现
+        MvcResult renewOk = renew("xk-renewed", "alice", "xn", 30_000);
+        assertEquals(200, renewOk.getResponse().getStatus());
+        long renewedExpire = json.readTree(renewOk.getResponse().getContentAsString())
+                .get("lease").get("expireAtMillis").asLong();
+
+        MvcResult acquireAfterRenew = acquire("xk-renewed", "alice", "xn", 60_000);
+        assertEquals(409, acquireAfterRenew.getResponse().getStatus());
+        JsonNode a2r = json.readTree(acquireAfterRenew.getResponse().getContentAsString());
+        assertEquals("conflict", a2r.get("type").asText());
+        assertEquals("IDEMPOTENCY_OPERATION_MISMATCH", a2r.get("reason").asText());
+        assertFalse(a2r.get("retryable").asBoolean(), "跨操作复用必须换键，原样重试无意义");
+
+        // 方向二：续期被拒后的标识再申请 -> 同样 409，而不是 400 bad_request
+        MvcResult renewDenied = renew("xk-denied", "bob", "xn", 10_000);
+        assertEquals(409, renewDenied.getResponse().getStatus());
+        MvcResult acquireAfterDeniedRenew = acquire("xk-denied", "bob", "xn", 60_000);
+        assertEquals(409, acquireAfterDeniedRenew.getResponse().getStatus());
+        JsonNode a2d = json.readTree(acquireAfterDeniedRenew.getResponse().getContentAsString());
+        assertEquals("conflict", a2d.get("type").asText());
+        assertEquals("IDEMPOTENCY_OPERATION_MISMATCH", a2d.get("reason").asText());
+
+        // 方向三：申请成功后的标识再续期 -> 409，到期时刻不变
+        MvcResult renewAfterAcquire = renew("xa", "alice", "xn", 30_000);
+        assertEquals(409, renewAfterAcquire.getResponse().getStatus());
+        JsonNode r2a = json.readTree(renewAfterAcquire.getResponse().getContentAsString());
+        assertEquals("IDEMPOTENCY_OPERATION_MISMATCH", r2a.get("reason").asText());
+        assertEquals(renewedExpire, store.get("xn").expireAtMillis(),
+                "跨操作冲突不得顺延到期时刻");
+
+        // 方向四：申请被拒后的标识再续期 -> 409
+        acquire("xq1", "alice", "xq1", 60_000);
+        acquire("xq2", "alice", "xq2", 60_000);
+        MvcResult acquireDenied = acquire("xk-acq-denied", "alice", "xq3", 60_000);
+        assertEquals(409, acquireDenied.getResponse().getStatus());
+        MvcResult renewAfterDeniedAcquire = renew("xk-acq-denied", "alice", "xn", 10_000);
+        assertEquals(409, renewAfterDeniedAcquire.getResponse().getStatus());
+        JsonNode r2d = json.readTree(renewAfterDeniedAcquire.getResponse().getContentAsString());
+        assertEquals("conflict", r2d.get("type").asText());
+        assertEquals("IDEMPOTENCY_OPERATION_MISMATCH", r2d.get("reason").asText());
+        assertEquals(renewedExpire, store.get("xn").expireAtMillis(), "全程到期时刻不变");
+        testLog.info("[ASSERT] op=HTTP_CROSS_OP basis=409-operation-mismatch-both-directions");
+    }
 }
